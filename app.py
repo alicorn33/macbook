@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -59,9 +60,6 @@ st.markdown(
     '<span class="tag">(Student)-[:PEER_OF]-(Student)</span><span class="tag">Neo4j Aura</span></div>',
     unsafe_allow_html=True)
 st.write("")
-
-if "flash" in st.session_state:
-    st.success(st.session_state.pop("flash"))
 
 # ---------- ข้อมูลหลัก ----------
 students = db.read("MATCH (s:Student) RETURN s.student_id AS id, s.name AS name, s.major AS major, s.year AS year ORDER BY id")
@@ -242,163 +240,339 @@ with t_3d:
         components.html(SHOWROOM.replace("__COLOR__", color).replace("__CHIP__", json.dumps(pick["chip"])), height=430)
         st.markdown(mac_card(pick), unsafe_allow_html=True)
 
-# ---------- จัดการข้อมูล ----------
+# ---------- จัดการข้อมูล (เพิ่ม / แก้ไข / ลบ) ----------
+TH = timezone(timedelta(hours=7))
+
+
+def K(name):
+    """key ของ widget ที่เปลี่ยนทุกครั้งหลังทำรายการสำเร็จ -> ฟอร์มรีเซ็ตและดึงค่าล่าสุดจากฐานข้อมูล"""
+    return f"{name}_{st.session_state.get('dm_n', 0)}"
+
+
+def done(text, ok=True, focus=None):
+    """บันทึกผลลัพธ์ แล้ว rerun เพื่อให้ตารางด้านบนอ่านข้อมูลสดจากฐานข้อมูลและแสดงผล"""
+    st.session_state["dm_result"] = {"text": text, "ok": ok}
+    st.session_state["dm_focus"] = focus
+    log = st.session_state.setdefault("dm_log", [])
+    log.insert(0, f"{datetime.now(TH):%H:%M:%S} · {'✅' if ok else '⚠️'} {text}")
+    del log[15:]
+    st.session_state["dm_n"] = st.session_state.get("dm_n", 0) + 1
+    st.rerun()
+
+
+def show_table(df, key_cols, focus):
+    """แสดงตาราง และไฮไลต์แถวที่เพิ่งเพิ่ม/แก้ไข"""
+    if df.empty:
+        st.info("ยังไม่มีข้อมูลในตารางนี้")
+        return
+
+    def hl(row):
+        hit = focus is not None and tuple(row[c] for c in key_cols) == tuple(focus)
+        return ["background-color: rgba(56,189,248,.30)"] * len(row) if hit else [""] * len(row)
+
+    st.dataframe(df.style.apply(hl, axis=1), use_container_width=True, hide_index=True)
+
+
+# ข้อมูลสดสำหรับตารางในหน้านี้ (cache ถูกล้างทุกครั้งที่เขียน จึงตรงกับฐานข้อมูลเสมอ)
+stu_rows = db.read("""MATCH (s:Student) OPTIONAL MATCH (s)-[:OWNS]->(m:MacBook)
+RETURN s.student_id AS id, s.name AS name, s.major AS major, s.year AS year, collect(m.model) AS models
+ORDER BY id""")
+owns = db.read("""MATCH (s:Student)-[:OWNS]->(m:MacBook)
+RETURN s.student_id AS sid, s.name AS sname, m.macbook_id AS mid, m.model AS model ORDER BY sid, mid""")
+df_stu = pd.DataFrame([{"รหัส": r["id"], "ชื่อ": r["name"], "สาขา": r["major"], "ชั้นปี": r["year"],
+                        "รุ่นที่ใช้": ", ".join(sorted(r["models"])) or "-"} for r in stu_rows],
+                      columns=["รหัส", "ชื่อ", "สาขา", "ชั้นปี", "รุ่นที่ใช้"])
+df_mac = pd.DataFrame([{"รหัสรุ่น": m["macbook_id"], "รุ่น": m["model"], "ชิป": m["chip"], "RAM (GB)": m["ram_gb"],
+                        "Storage (GB)": m["storage_gb"], "ราคา (บาท)": m["price_thb"],
+                        "เหมาะกับงาน": m["suited_for"], "จำนวนคนใช้": m["owners"]} for m in macbooks],
+                      columns=["รหัสรุ่น", "รุ่น", "ชิป", "RAM (GB)", "Storage (GB)", "ราคา (บาท)",
+                               "เหมาะกับงาน", "จำนวนคนใช้"]).sort_values("รหัสรุ่น")
+df_own = pd.DataFrame([{"รหัสนักศึกษา": o["sid"], "ชื่อ": o["sname"], "รหัสรุ่น": o["mid"], "รุ่น": o["model"]}
+                       for o in owns], columns=["รหัสนักศึกษา", "ชื่อ", "รหัสรุ่น", "รุ่น"])
+
 with t_data:
-    st.subheader("ข้อมูลตัวอย่าง")
-    if st.button("สร้าง Constraint + Demo Data", type="primary"):
-        db.seed_demo()
-        st.session_state["flash"] = "สร้าง Constraint และข้อมูลตัวอย่างเรียบร้อย (กดซ้ำได้ ไม่สร้างข้อมูลซ้ำ)"
-        st.rerun()
+    # ----- ผลลัพธ์ของการกระทำล่าสุด (อยู่บนสุดของหน้านี้) -----
+    res = st.session_state.pop("dm_result", None)
+    if res:
+        (st.success if res["ok"] else st.warning)(res["text"])
+        st.toast(res["text"], icon="✅" if res["ok"] else "⚠️")
 
-    st.subheader("เพิ่มนักศึกษา")
-    with st.form("f_student", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns([1, 1.5, 2, 1])
-        sid = c1.text_input("รหัส", placeholder="U011")
-        sname = c2.text_input("ชื่อ")
-        smajor = c3.text_input("สาขา")
-        syear = c4.number_input("ชั้นปี", 1, 4, 1)
-        if st.form_submit_button("เพิ่มนักศึกษา") and sid.strip() and sname.strip() and smajor.strip():
-            db.add_student(sid.strip(), sname.strip(), smajor.strip(), int(syear))
-            st.session_state["flash"] = f"เพิ่มนักศึกษา {sname} แล้ว และอัปเดต PEER_OF ให้อัตโนมัติ"
-            st.rerun()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Students", cnt["students"])
+    m2.metric("MacBooks", cnt["macbooks"])
+    m3.metric("OWNS", cnt["owns"])
+    m4.metric("PEER_OF (คู่)", cnt["peers"] // 2)
 
-    st.subheader("เพิ่ม MacBook")
-    with st.form("f_mac", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        mid = c1.text_input("รหัสรุ่น", placeholder="M011")
-        model = c2.text_input("ชื่อรุ่น", placeholder="MacBook Air M4")
-        chip = c3.text_input("ชิป", placeholder="M4")
-        c4, c5, c6 = st.columns(3)
-        ram = c4.number_input("RAM (GB)", 4, 128, 16)
-        sto = c5.number_input("Storage (GB)", 128, 8192, 512, step=128)
-        price = c6.number_input("ราคา (บาท)", 10000, 500000, 40000, step=1000)
-        suited = st.text_input("เหมาะกับงาน", placeholder="เขียนโปรแกรม / ตัดต่อวิดีโอ")
-        if st.form_submit_button("เพิ่ม MacBook") and mid.strip() and model.strip() and chip.strip():
-            db.add_macbook({"macbook_id": mid.strip(), "model": model.strip(), "chip": chip.strip(),
-                            "ram_gb": int(ram), "storage_gb": int(sto), "price_thb": int(price),
-                            "suited_for": suited.strip() or "-"})
-            st.session_state["flash"] = f"เพิ่ม {model} แล้ว"
-            st.rerun()
+    with st.expander("🌱 ข้อมูลตัวอย่าง / ล้างข้อมูลทั้งหมด"):
+        if st.button("สร้าง Constraint + Demo Data", type="primary"):
+            db.seed_demo()
+            done("สร้าง Constraint และข้อมูลตัวอย่างเรียบร้อย (กดซ้ำได้ ไม่สร้างข้อมูลซ้ำ)")
+        if st.checkbox("ยืนยันว่าต้องการลบ Student / MacBook ทั้งหมด", key=K("clr_ok")):
+            if st.button("🗑️ ลบข้อมูลทั้งหมด", key=K("clr_btn")):
+                db.clear_all()
+                done("ลบข้อมูล Student / MacBook ทั้งหมดแล้ว")
 
-    st.subheader("บันทึกว่านักศึกษาใช้ MacBook รุ่นไหน (OWNS)")
-    if students and macbooks:
-        with st.form("f_owns"):
-            c1, c2 = st.columns(2)
-            s_sel = c1.selectbox("นักศึกษา", [f'{s["id"]} — {s["name"]}' for s in students])
-            m_sel = c2.selectbox("MacBook", [f'{m["macbook_id"]} — {m["model"]}' for m in macbooks])
-            if st.form_submit_button("บันทึก OWNS"):
-                db.add_owns(s_sel.split(" — ")[0], m_sel.split(" — ")[0])
-                st.session_state["flash"] = f"บันทึก {s_sel} ใช้ {m_sel} แล้ว"
-                st.rerun()
+    # ----- เลือกว่าจะจัดการอะไร -----
+    ENT = {"👤 นักศึกษา": "student", "💻 MacBook": "macbook", "🔗 OWNS (รุ่นที่ใช้)": "owns"}
+    ACT = {"➕ เพิ่ม": "add", "✏️ แก้ไข": "edit", "🗑️ ลบ": "delete"}
+    entity = ENT[st.radio("เลือกข้อมูลที่จะจัดการ", list(ENT), horizontal=True, key="dm_entity")]
+    action = ACT[st.radio("การทำงาน", list(ACT), horizontal=True, key="dm_action")]
 
-    # ---------- แก้ไข / ลบ ----------
-    st.subheader("✏️ แก้ไข / 🗑️ ลบข้อมูล")
-    e_stu, e_mac, e_own = st.tabs(["นักศึกษา", "MacBook", "OWNS (รุ่นที่ใช้)"])
+    # ----- ตารางข้อมูลปัจจุบัน (เห็นผลจริงทุกครั้งที่เพิ่ม/แก้/ลบ) -----
+    focus = st.session_state.get("dm_focus")
+    focus = focus[1:] if focus and focus[0] == entity else None
+    st.markdown("##### 📋 ข้อมูลปัจจุบันในฐานข้อมูล" + (" · แถวสีฟ้า = เพิ่ง เพิ่ม/แก้ไข" if focus else ""))
+    if entity == "student":
+        show_table(df_stu, ["รหัส"], focus)
+    elif entity == "macbook":
+        show_table(df_mac, ["รหัสรุ่น"], focus)
+    else:
+        show_table(df_own, ["รหัสนักศึกษา", "รหัสรุ่น"], focus)
+    st.divider()
 
-    # --- นักศึกษา ---
-    with e_stu:
+    # ================= นักศึกษา =================
+    if entity == "student" and action == "add":
+        st.markdown("##### ➕ เพิ่มนักศึกษา")
+        with st.form(K("f_add_stu")):
+            c1, c2, c3, c4 = st.columns([1, 1.5, 2, 1])
+            sid = c1.text_input("รหัส", placeholder="U011", key=K("as_id"))
+            sname = c2.text_input("ชื่อ", key=K("as_name"))
+            smajor = c3.text_input("สาขา", key=K("as_major"))
+            syear = c4.number_input("ชั้นปี", 1, 8, 1, key=K("as_year"))
+            go = st.form_submit_button("➕ เพิ่มนักศึกษา", type="primary")
+        if go:
+            sid, sname, smajor = sid.strip(), sname.strip(), smajor.strip()
+            if not (sid and sname and smajor):
+                st.error("กรุณากรอกให้ครบ: รหัส ชื่อ และสาขา")
+            elif db.exists("Student", "student_id", sid):
+                st.error(f"รหัส {sid} มีอยู่แล้ว ถ้าต้องการเปลี่ยนข้อมูลให้เลือก ✏️ แก้ไข")
+            else:
+                c = db.add_student(sid, sname, smajor, int(syear))
+                if c["nodes_created"] == 0:
+                    done(f"เพิ่ม {sid} ไม่สำเร็จ (ฐานข้อมูลไม่ได้สร้างข้อมูลใหม่)", ok=False)
+                done(f"เพิ่มนักศึกษา {sid} — {sname} แล้ว · PEER_OF ทั้งระบบตอนนี้ {c['peer_pairs']} คู่",
+                     focus=("student", sid))
+
+    elif entity == "student" and action == "edit":
+        st.markdown("##### ✏️ แก้ไขนักศึกษา")
         if not students:
-            st.info("ยังไม่มีนักศึกษา")
+            st.info("ยังไม่มีนักศึกษาให้แก้ไข")
         else:
             by_id = {s["id"]: s for s in students}
             pid = st.selectbox("เลือกนักศึกษา", list(by_id), key="es_pick",
                                format_func=lambda i: f'{i} — {by_id[i]["name"]}')
             cur = by_id[pid]
-            with st.form(f"f_edit_stu_{pid}"):
+            with st.form(K(f"f_edit_stu_{pid}")):
                 st.caption(f"รหัส {pid} (แก้ไม่ได้)")
                 c1, c2, c3 = st.columns([1.5, 2, 1])
-                n_name = c1.text_input("ชื่อ", cur["name"] or "", key=f"es_name_{pid}")
-                n_major = c2.text_input("สาขา", cur["major"] or "", key=f"es_major_{pid}")
-                n_year = c3.number_input("ชั้นปี", 1, 8, int(cur["year"] or 1), key=f"es_year_{pid}")
-                if st.form_submit_button("💾 บันทึกการแก้ไข", type="primary"):
-                    if n_name.strip() and n_major.strip():
-                        db.update_student(pid, n_name.strip(), n_major.strip(), int(n_year))
-                        st.session_state["flash"] = f"แก้ไขนักศึกษา {pid} แล้ว และคำนวณ PEER_OF ใหม่"
-                        st.rerun()
-                    else:
-                        st.warning("กรุณากรอกชื่อและสาขา")
+                n_name = c1.text_input("ชื่อ", cur["name"] or "", key=K(f"es_name_{pid}"))
+                n_major = c2.text_input("สาขา", cur["major"] or "", key=K(f"es_major_{pid}"))
+                n_year = c3.number_input("ชั้นปี", 1, 8, int(cur["year"] or 1), key=K(f"es_year_{pid}"))
+                go = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary")
+            if go:
+                n_name, n_major, n_year = n_name.strip(), n_major.strip(), int(n_year)
+                changes = [f"{lbl}: {a} → {b}" for lbl, a, b in
+                           [("ชื่อ", cur["name"], n_name), ("สาขา", cur["major"], n_major),
+                            ("ชั้นปี", cur["year"], n_year)] if a != b]
+                if not (n_name and n_major):
+                    st.error("กรุณากรอกชื่อและสาขา")
+                elif not changes:
+                    st.warning("ไม่มีการเปลี่ยนแปลง จึงไม่ได้บันทึก")
+                else:
+                    c = db.update_student(pid, n_name, n_major, n_year)
+                    if c["props_set"] == 0:
+                        done(f"ไม่พบนักศึกษา {pid} ในฐานข้อมูล (อาจถูกลบไปแล้ว)", ok=False)
+                    done(f"แก้ไขนักศึกษา {pid} แล้ว · " + " · ".join(changes) +
+                         f" · PEER_OF ตอนนี้ {c['peer_pairs']} คู่", focus=("student", pid))
 
-            n_owns = db.read("MATCH (:Student {student_id:$sid})-[o:OWNS]->() RETURN count(o) AS n", sid=pid)[0]["n"]
-            st.caption(f"การลบจะลบความสัมพันธ์ OWNS ของนักศึกษาคนนี้ {n_owns} รายการด้วย")
-            ok = st.checkbox(f"ยืนยันลบ {pid} — {cur['name']}", key=f"es_del_ok_{pid}")
-            if st.button("🗑️ ลบนักศึกษา", disabled=not ok, key=f"es_del_{pid}"):
-                db.delete_student(pid)
-                st.session_state["flash"] = f"ลบนักศึกษา {pid} แล้ว"
-                st.rerun()
+    elif entity == "student" and action == "delete":
+        st.markdown("##### 🗑️ ลบนักศึกษา")
+        if not students:
+            st.info("ยังไม่มีนักศึกษาให้ลบ")
+        else:
+            by_id = {s["id"]: s for s in students}
+            pid = st.selectbox("เลือกนักศึกษา", list(by_id), key="ds_pick",
+                               format_func=lambda i: f'{i} — {by_id[i]["name"]}')
+            cur = by_id[pid]
+            n_own = sum(1 for o in owns if o["sid"] == pid)
+            st.warning(f'จะลบ **{pid} — {cur["name"]}** ({cur["major"]} ปี {cur["year"]}) '
+                       f'พร้อมความสัมพันธ์ OWNS {n_own} รายการ และ PEER_OF ที่เกี่ยวข้อง')
+            ok = st.checkbox("ยืนยันการลบ", key=K(f"ds_ok_{pid}"))
+            if st.button("🗑️ ลบนักศึกษา", disabled=not ok, key=K(f"ds_btn_{pid}")):
+                c = db.delete_student(pid)
+                if c["nodes_deleted"] == 0:
+                    done(f"ไม่พบนักศึกษา {pid} ในฐานข้อมูล (อาจถูกลบไปแล้ว)", ok=False)
+                peer_pairs = max(c["rels_deleted"] - n_own, 0) // 2  # PEER_OF เก็บ 2 ทิศ = 1 คู่
+                done(f'ลบนักศึกษา {pid} — {cur["name"]} แล้ว · ลบโหนด {c["nodes_deleted"]} · '
+                     f'ลบ OWNS {n_own} รายการ · ลบ PEER_OF {peer_pairs} คู่')
 
-    # --- MacBook ---
-    with e_mac:
+    # ================= MacBook =================
+    elif entity == "macbook" and action == "add":
+        st.markdown("##### ➕ เพิ่ม MacBook")
+        with st.form(K("f_add_mac")):
+            c1, c2, c3 = st.columns(3)
+            mid = c1.text_input("รหัสรุ่น", placeholder="M011", key=K("am_id"))
+            model = c2.text_input("ชื่อรุ่น", placeholder="MacBook Air M4", key=K("am_model"))
+            chip = c3.text_input("ชิป", placeholder="M4", key=K("am_chip"))
+            c4, c5, c6 = st.columns(3)
+            ram = c4.number_input("RAM (GB)", 1, 512, 16, key=K("am_ram"))
+            sto = c5.number_input("Storage (GB)", 64, 16384, 512, step=64, key=K("am_sto"))
+            price = c6.number_input("ราคา (บาท)", 0, 1000000, 40000, step=1000, key=K("am_price"))
+            suited = st.text_input("เหมาะกับงาน", placeholder="เขียนโปรแกรม / ตัดต่อวิดีโอ", key=K("am_suit"))
+            go = st.form_submit_button("➕ เพิ่ม MacBook", type="primary")
+        if go:
+            mid, model, chip = mid.strip(), model.strip(), chip.strip()
+            if not (mid and model and chip):
+                st.error("กรุณากรอกให้ครบ: รหัสรุ่น ชื่อรุ่น และชิป")
+            elif db.exists("MacBook", "macbook_id", mid):
+                st.error(f"รหัสรุ่น {mid} มีอยู่แล้ว ถ้าต้องการเปลี่ยนข้อมูลให้เลือก ✏️ แก้ไข")
+            else:
+                c = db.add_macbook({"macbook_id": mid, "model": model, "chip": chip, "ram_gb": int(ram),
+                                    "storage_gb": int(sto), "price_thb": int(price),
+                                    "suited_for": suited.strip() or "-"})
+                if c["nodes_created"] == 0:
+                    done(f"เพิ่ม {mid} ไม่สำเร็จ (ฐานข้อมูลไม่ได้สร้างข้อมูลใหม่)", ok=False)
+                done(f"เพิ่ม MacBook {mid} — {model} แล้ว (ราคา ฿{int(price):,})", focus=("macbook", mid))
+
+    elif entity == "macbook" and action == "edit":
+        st.markdown("##### ✏️ แก้ไข MacBook")
         if not macbooks:
-            st.info("ยังไม่มี MacBook")
+            st.info("ยังไม่มี MacBook ให้แก้ไข")
         else:
             by_mid = {m["macbook_id"]: m for m in macbooks}
-            mpid = st.selectbox("เลือก MacBook", list(by_mid), key="em_pick",
+            mpid = st.selectbox("เลือก MacBook", sorted(by_mid), key="em_pick",
                                 format_func=lambda i: f'{i} — {by_mid[i]["model"]}')
             cm = by_mid[mpid]
-            with st.form(f"f_edit_mac_{mpid}"):
+            with st.form(K(f"f_edit_mac_{mpid}")):
                 st.caption(f"รหัสรุ่น {mpid} (แก้ไม่ได้)")
                 c1, c2 = st.columns(2)
-                m_model = c1.text_input("ชื่อรุ่น", cm["model"] or "", key=f"em_model_{mpid}")
-                m_chip = c2.text_input("ชิป", cm["chip"] or "", key=f"em_chip_{mpid}")
+                m_model = c1.text_input("ชื่อรุ่น", cm["model"] or "", key=K(f"em_model_{mpid}"))
+                m_chip = c2.text_input("ชิป", cm["chip"] or "", key=K(f"em_chip_{mpid}"))
                 c3, c4, c5 = st.columns(3)
-                m_ram = c3.number_input("RAM (GB)", 1, 512, int(cm["ram_gb"] or 8), key=f"em_ram_{mpid}")
+                m_ram = c3.number_input("RAM (GB)", 1, 512, int(cm["ram_gb"] or 8), key=K(f"em_ram_{mpid}"))
                 m_sto = c4.number_input("Storage (GB)", 64, 16384, int(cm["storage_gb"] or 256), step=64,
-                                        key=f"em_sto_{mpid}")
+                                        key=K(f"em_sto_{mpid}"))
                 m_price = c5.number_input("ราคา (บาท)", 0, 1000000, int(cm["price_thb"] or 0), step=1000,
-                                          key=f"em_price_{mpid}")
-                m_suit = st.text_input("เหมาะกับงาน", cm["suited_for"] or "", key=f"em_suit_{mpid}")
-                if st.form_submit_button("💾 บันทึกการแก้ไข", type="primary"):
-                    if m_model.strip() and m_chip.strip():
-                        db.update_macbook({"macbook_id": mpid, "model": m_model.strip(), "chip": m_chip.strip(),
+                                          key=K(f"em_price_{mpid}"))
+                m_suit = st.text_input("เหมาะกับงาน", cm["suited_for"] or "", key=K(f"em_suit_{mpid}"))
+                go = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary")
+            if go:
+                m_model, m_chip, m_suit = m_model.strip(), m_chip.strip(), m_suit.strip() or "-"
+                changes = [f"{lbl}: {a} → {b}" for lbl, a, b in
+                           [("ชื่อรุ่น", cm["model"], m_model), ("ชิป", cm["chip"], m_chip),
+                            ("RAM", cm["ram_gb"], int(m_ram)), ("Storage", cm["storage_gb"], int(m_sto)),
+                            ("ราคา", cm["price_thb"], int(m_price)), ("เหมาะกับ", cm["suited_for"], m_suit)]
+                           if a != b]
+                if not (m_model and m_chip):
+                    st.error("กรุณากรอกชื่อรุ่นและชิป")
+                elif not changes:
+                    st.warning("ไม่มีการเปลี่ยนแปลง จึงไม่ได้บันทึก")
+                else:
+                    c = db.update_macbook({"macbook_id": mpid, "model": m_model, "chip": m_chip,
                                            "ram_gb": int(m_ram), "storage_gb": int(m_sto),
-                                           "price_thb": int(m_price), "suited_for": m_suit.strip() or "-"})
-                        st.session_state["flash"] = f"แก้ไข MacBook {mpid} แล้ว"
-                        st.rerun()
-                    else:
-                        st.warning("กรุณากรอกชื่อรุ่นและชิป")
+                                           "price_thb": int(m_price), "suited_for": m_suit})
+                    if c["props_set"] == 0:
+                        done(f"ไม่พบ MacBook {mpid} ในฐานข้อมูล (อาจถูกลบไปแล้ว)", ok=False)
+                    done(f"แก้ไข MacBook {mpid} แล้ว · " + " · ".join(changes), focus=("macbook", mpid))
 
-            st.caption(f'การลบจะลบความสัมพันธ์ OWNS ของรุ่นนี้ ({cm["owners"]} คนใช้) ด้วย')
-            ok = st.checkbox(f"ยืนยันลบ {mpid} — {cm['model']}", key=f"em_del_ok_{mpid}")
-            if st.button("🗑️ ลบ MacBook", disabled=not ok, key=f"em_del_{mpid}"):
-                db.delete_macbook(mpid)
-                st.session_state["flash"] = f"ลบ MacBook {mpid} แล้ว"
-                st.rerun()
+    elif entity == "macbook" and action == "delete":
+        st.markdown("##### 🗑️ ลบ MacBook")
+        if not macbooks:
+            st.info("ยังไม่มี MacBook ให้ลบ")
+        else:
+            by_mid = {m["macbook_id"]: m for m in macbooks}
+            mpid = st.selectbox("เลือก MacBook", sorted(by_mid), key="dm_pick",
+                                format_func=lambda i: f'{i} — {by_mid[i]["model"]}')
+            cm = by_mid[mpid]
+            st.warning(f'จะลบ **{mpid} — {cm["model"]}** พร้อมความสัมพันธ์ OWNS ของรุ่นนี้ ({cm["owners"]} คนใช้)')
+            ok = st.checkbox("ยืนยันการลบ", key=K(f"dm_ok_{mpid}"))
+            if st.button("🗑️ ลบ MacBook", disabled=not ok, key=K(f"dm_btn_{mpid}")):
+                c = db.delete_macbook(mpid)
+                if c["nodes_deleted"] == 0:
+                    done(f"ไม่พบ MacBook {mpid} ในฐานข้อมูล (อาจถูกลบไปแล้ว)", ok=False)
+                done(f'ลบ MacBook {mpid} — {cm["model"]} แล้ว · ลบโหนด {c["nodes_deleted"]} · '
+                     f'ลบความสัมพันธ์ {c["rels_deleted"]} รายการ')
 
-    # --- OWNS ---
-    with e_own:
-        owns = db.read("""MATCH (s:Student)-[:OWNS]->(m:MacBook)
-        RETURN s.student_id AS sid, s.name AS sname, m.macbook_id AS mid, m.model AS model
-        ORDER BY sid, mid""")
+    # ================= OWNS =================
+    elif entity == "owns" and action == "add":
+        st.markdown("##### ➕ บันทึกว่านักศึกษาใช้ MacBook รุ่นไหน")
+        if not (students and macbooks):
+            st.info("ต้องมีทั้งนักศึกษาและ MacBook ก่อน")
+        else:
+            s_ids = [s["id"] for s in students]
+            s_name = {s["id"]: s["name"] for s in students}
+            m_ids = sorted(m["macbook_id"] for m in macbooks)
+            m_name = {m["macbook_id"]: m["model"] for m in macbooks}
+            with st.form(K("f_add_own")):
+                c1, c2 = st.columns(2)
+                s_sel = c1.selectbox("นักศึกษา", s_ids, format_func=lambda i: f"{i} — {s_name[i]}",
+                                     key=K("ao_s"))
+                m_sel = c2.selectbox("MacBook", m_ids, format_func=lambda i: f"{i} — {m_name[i]}",
+                                     key=K("ao_m"))
+                go = st.form_submit_button("➕ บันทึก OWNS", type="primary")
+            if go:
+                if any(o["sid"] == s_sel and o["mid"] == m_sel for o in owns):
+                    st.warning(f"{s_sel} ใช้ {m_sel} อยู่แล้ว ไม่ได้เพิ่มซ้ำ")
+                else:
+                    c = db.add_owns(s_sel, m_sel)
+                    if c["rels_created"] == 0:
+                        done(f"บันทึก OWNS ไม่สำเร็จ ({s_sel} → {m_sel})", ok=False)
+                    done(f"บันทึกแล้ว: {s_sel} {s_name[s_sel]} ใช้ {m_sel} {m_name[m_sel]}",
+                         focus=("owns", s_sel, m_sel))
+
+    elif entity == "owns" and action == "edit":
+        st.markdown("##### ✏️ เปลี่ยนรุ่นที่นักศึกษาใช้")
         if not owns:
-            st.info("ยังไม่มีข้อมูล OWNS")
+            st.info("ยังไม่มีข้อมูล OWNS ให้แก้ไข")
         else:
             pairs = {f'{o["sid"]}|{o["mid"]}': o for o in owns}
             pk = st.selectbox("เลือกรายการ OWNS", list(pairs), key="eo_pick",
                               format_func=lambda k: f'{pairs[k]["sid"]} {pairs[k]["sname"]}  →  '
                                                     f'{pairs[k]["mid"]} {pairs[k]["model"]}')
             po = pairs[pk]
-            mac_ids = [m["macbook_id"] for m in macbooks]
-            mac_name = {m["macbook_id"]: m["model"] for m in macbooks}
-            c1, c2 = st.columns([3, 1])
-            new_mid = c1.selectbox("เปลี่ยนเป็นรุ่น", mac_ids, index=mac_ids.index(po["mid"]),
-                                   format_func=lambda i: f"{i} — {mac_name[i]}", key=f"eo_new_{pk}")
-            c2.write("")
-            c2.write("")
-            if c2.button("💾 บันทึก", key=f"eo_save_{pk}", disabled=new_mid == po["mid"]):
-                db.change_owns(po["sid"], po["mid"], new_mid)
-                st.session_state["flash"] = f'เปลี่ยนรุ่นของ {po["sid"]} เป็น {new_mid} แล้ว'
-                st.rerun()
-            ok = st.checkbox("ยืนยันลบรายการนี้", key=f"eo_del_ok_{pk}")
-            if st.button("🗑️ ลบ OWNS", disabled=not ok, key=f"eo_del_{pk}"):
-                db.delete_owns(po["sid"], po["mid"])
-                st.session_state["flash"] = f'ลบ OWNS {po["sid"]} → {po["mid"]} แล้ว'
-                st.rerun()
+            m_ids = sorted(m["macbook_id"] for m in macbooks)
+            m_name = {m["macbook_id"]: m["model"] for m in macbooks}
+            with st.form(K(f"f_edit_own_{pk}")):
+                new_mid = st.selectbox("เปลี่ยนเป็นรุ่น", m_ids, index=m_ids.index(po["mid"]),
+                                       format_func=lambda i: f"{i} — {m_name[i]}", key=K(f"eo_new_{pk}"))
+                go = st.form_submit_button("💾 บันทึกการเปลี่ยนแปลง", type="primary")
+            if go:
+                if new_mid == po["mid"]:
+                    st.warning("เลือกรุ่นเดิม ไม่มีการเปลี่ยนแปลง")
+                elif any(o["sid"] == po["sid"] and o["mid"] == new_mid for o in owns):
+                    st.warning(f'{po["sid"]} ใช้ {new_mid} อยู่แล้ว ให้ลบรายการเก่าแทน')
+                else:
+                    c = db.change_owns(po["sid"], po["mid"], new_mid)
+                    if c["rels_created"] == 0:
+                        done("ไม่พบรายการ OWNS เดิม (อาจถูกลบไปแล้ว)", ok=False)
+                    done(f'เปลี่ยนรุ่นของ {po["sid"]} {po["sname"]}: {po["mid"]} {po["model"]} → '
+                         f'{new_mid} {m_name[new_mid]}', focus=("owns", po["sid"], new_mid))
 
-    with st.expander("⚠️ ล้างข้อมูล Student / MacBook ทั้งหมด"):
-        if st.checkbox("ยืนยันว่าต้องการลบข้อมูลทั้งหมด") and st.button("ลบข้อมูลทั้งหมด"):
-            db.clear_all()
-            st.session_state["flash"] = "ลบข้อมูลทั้งหมดแล้ว"
-            st.rerun()
+    elif entity == "owns" and action == "delete":
+        st.markdown("##### 🗑️ ลบรายการ OWNS")
+        if not owns:
+            st.info("ยังไม่มีข้อมูล OWNS ให้ลบ")
+        else:
+            pairs = {f'{o["sid"]}|{o["mid"]}': o for o in owns}
+            pk = st.selectbox("เลือกรายการ OWNS", list(pairs), key="do_pick",
+                              format_func=lambda k: f'{pairs[k]["sid"]} {pairs[k]["sname"]}  →  '
+                                                    f'{pairs[k]["mid"]} {pairs[k]["model"]}')
+            po = pairs[pk]
+            st.warning(f'จะลบความสัมพันธ์ **{po["sid"]} {po["sname"]} → {po["mid"]} {po["model"]}** '
+                       "(ตัวนักศึกษาและตัว MacBook ยังอยู่)")
+            ok = st.checkbox("ยืนยันการลบ", key=K(f"do_ok_{pk}"))
+            if st.button("🗑️ ลบ OWNS", disabled=not ok, key=K(f"do_btn_{pk}")):
+                c = db.delete_owns(po["sid"], po["mid"])
+                if c["rels_deleted"] == 0:
+                    done("ไม่พบรายการ OWNS นี้ (อาจถูกลบไปแล้ว)", ok=False)
+                done(f'ลบ OWNS แล้ว: {po["sid"]} {po["sname"]} → {po["mid"]} {po["model"]}')
+
+    # ----- ประวัติการเปลี่ยนแปลงในเซสชันนี้ -----
+    if st.session_state.get("dm_log"):
+        with st.expander("📜 ประวัติการเปลี่ยนแปลงในเซสชันนี้"):
+            for line in st.session_state["dm_log"]:
+                st.write(line)
+
 
 # ---------- กราฟ ----------
 with t_graph:
